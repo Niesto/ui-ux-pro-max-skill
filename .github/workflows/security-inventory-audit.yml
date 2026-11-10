@@ -1,0 +1,76 @@
+name: Security inventory audit
+on:
+  push:
+    branches: [security/authorized-inventory-audit-20261110]
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install verified scanner
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/scanner"
+          curl --fail --silent --show-error --location --retry 3 https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz --output "$RUNNER_TEMP/scanner.tar.gz"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $RUNNER_TEMP/scanner.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/scanner.tar.gz" -C "$RUNNER_TEMP/scanner" gitleaks
+          echo "$RUNNER_TEMP/scanner" >> "$GITHUB_PATH"
+      - name: Audit source and full retained Git history
+        shell: bash
+        env:
+          AUDIT_BASE_SHA: 8bd29e775453ebcae52b6e6514fbf134df0c5770
+        run: |
+          set -euo pipefail
+          printf '[extend]\nuseDefault = true\n' > "$RUNNER_TEMP/audit-config.toml"
+          touch "$RUNNER_TEMP/empty.ignore"
+          for mode in current history; do
+            set +e
+            if [ "$mode" = current ]; then
+              gitleaks dir . --config "$RUNNER_TEMP/audit-config.toml" --gitleaks-ignore-path "$RUNNER_TEMP/empty.ignore" --ignore-gitleaks-allow --redact=100 --no-banner --report-format json --report-path "$RUNNER_TEMP/$mode.json" > "$RUNNER_TEMP/$mode.log" 2>&1
+            else
+              gitleaks git . --log-opts="--all" --config "$RUNNER_TEMP/audit-config.toml" --gitleaks-ignore-path "$RUNNER_TEMP/empty.ignore" --ignore-gitleaks-allow --redact=100 --no-banner --report-format json --report-path "$RUNNER_TEMP/$mode.json" > "$RUNNER_TEMP/$mode.log" 2>&1
+            fi
+            code=$?
+            set -e
+            if [ "$code" -ne 0 ] && [ "$code" -ne 1 ]; then
+              echo "::error::Scanner failed in $mode mode, exit $code. Raw diagnostics retained only on the disposable runner."
+              exit "$code"
+            fi
+          done
+          python3 - <<'PY'
+          import collections, json, os, pathlib, re, subprocess
+          temp = pathlib.Path(os.environ["RUNNER_TEMP"])
+          reports = {mode: json.loads((temp / (mode + ".json")).read_text()) for mode in ("current", "history")}
+          print("AUDIT_SUMMARY " + json.dumps({
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "base_sha": os.environ["AUDIT_BASE_SHA"],
+              "audit_sha": os.environ["GITHUB_SHA"],
+              "commits_scanned": int(subprocess.check_output(["git", "rev-list", "--all", "--count"], text=True).strip()),
+              "current_findings": len(reports["current"]),
+              "historical_findings": len(reports["history"]),
+              "rules": {mode: dict(collections.Counter(f["RuleID"] for f in items)) for mode, items in reports.items()},
+              "scanner": "gitleaks-8.30.1-default-rules-no-local-exceptions"
+          }, sort_keys=True))
+          for mode, items in reports.items():
+              for finding in items:
+                  print("AUDIT_FINDING " + json.dumps({
+                      "scope": mode, "rule": finding["RuleID"], "file": finding["File"],
+                      "line": finding["StartLine"], "commit": finding.get("Commit", "")
+                  }, sort_keys=True))
+          tracked = subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")
+          for path in tracked:
+              if re.search(r"(^|/)\.env($|\.(?!example$|sample$|template$))", path):
+                  print("AUDIT_ENV_FILE " + json.dumps({"file": path}))
+          print("AUDIT_COMPLETED " + json.dumps({"current_and_history": True}))
+          PY
+      - name: Delete temporary reports
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/current.json" "$RUNNER_TEMP/history.json" "$RUNNER_TEMP/current.log" "$RUNNER_TEMP/history.log"
